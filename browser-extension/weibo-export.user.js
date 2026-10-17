@@ -1,8 +1,8 @@
-﻿// ==UserScript==
+// ==UserScript==
 // @name         微博备份导出（本人微博 → JSON / 可打印 HTML / PDF）
 // @name:en      Weibo Export (own posts -> JSON / printable HTML / PDF)
 // @namespace    qingyu.weibo-export
-// @version      0.2.6
+// @version      0.2.7
 // @description  结合 Weibo-archiver 与 WeiBack 思路：抓取本人全部微博（since_id 全量翻页、长文、评论、收藏、关注），IndexedDB 本地存储支持断点续传；导出 JSON 与可打印 HTML（浏览器 Ctrl+P 存 PDF），可选图片内嵌做离线导出。
 // @description:en Fetch your own Weibo posts (since_id paging, long-text, comments, favorites, followings), store in IndexedDB with resume; export JSON & printable HTML (Ctrl+P to PDF), optional embedded images for offline use.
 // @author       qingyu
@@ -21,7 +21,7 @@
   const LS_OPTIONS = 'wbx-options-v1';
   const DB_NAME = 'weibo-export';
   const DB_VERSION = 1;
-  const SCRIPT_VERSION = '0.2.6';
+  const SCRIPT_VERSION = '0.2.7';
   const doc = typeof document !== 'undefined' ? document : null;
   const win = typeof window !== 'undefined' ? window : null;
 
@@ -207,6 +207,15 @@
       .finally(() => clearTimeout(timer));
   }
 
+  // 微博部分接口要求携带与 cookie 同名的 CSRF 头，缺失时可能被拒
+  function xsrfHeaders() {
+    try {
+      const m = (doc && doc.cookie ? doc.cookie : '').match(/(?:^|;\s*)XSRF-TOKEN=([^;]+)/);
+      if (m) return { 'x-xsrf-token': decodeURIComponent(m[1]) };
+    } catch (e) { /* ignore */ }
+    return {};
+  }
+
   async function apiGet(path, params, opt) {
     const cfg = opt || {};
     const retries = cfg.retries === undefined ? 4 : cfg.retries;
@@ -222,20 +231,24 @@
       try {
         const res = await fetchWithTimeout(url, cfg.timeout || 20000, {
           credentials: 'include',
-          headers: { 'X-Requested-With': 'XMLHttpRequest' },
+          headers: Object.assign({ 'X-Requested-With': 'XMLHttpRequest' }, xsrfHeaders()),
         });
-        if (!res.ok) throw new WeiboApiError('HTTP ' + res.status);
+        if (!res.ok) throw new WeiboApiError('HTTP ' + res.status + ' @ ' + path);
+        // 先按文本读，便于识别「被重定向到登录页」这类非 JSON 响应
+        const text = await res.text();
         let json;
         try {
-          json = await res.json();
+          json = JSON.parse(text);
         } catch (e) {
-          throw new WeiboApiError('响应不是 JSON，可能未登录或会话已失效');
+          const head = text.replace(/\s+/g, ' ').slice(0, 120);
+          throw new WeiboApiError('返回的不是 JSON（登录态失效或被风控页拦截）：' + head);
         }
-        if (json && json.ok === 1) return json;
+        if (json && (json.ok === 1 || (json.ok === undefined && json.data))) return json;
         if (json && (json.ok === -100 || json.ok === -101 || json.ok === -3)) {
-          throw new WeiboApiError('触发微博风控/验证码，请先到网页手动验证，再点“继续导出”');
+          throw new WeiboApiError('触发微博风控/验证码（ok=' + json.ok + '），请先到网页手动验证，再点“继续导出”');
         }
-        throw new WeiboApiError('接口返回异常 ok=' + (json && json.ok));
+        throw new WeiboApiError('接口返回异常 ok=' + (json && json.ok) +
+          (json && json.msg ? ' msg=' + json.msg : '') + ' @ ' + path);
       } catch (e) {
         attempt++;
         if (attempt > retries) throw e;
@@ -503,6 +516,9 @@
   async function fetchAllBySinceId(uid) {
     let page = state.page || 1;
     let guard = 0;
+    // 去重 + 空页保护：接口若忽略 since_id 反复返回同一页，能在两次「无新数据」后停下
+    const seenIds = new Set();
+    let noNewStreak = 0;
     while (true) {
       if (++guard > 50000) break;
       await waitWhilePaused();
@@ -526,13 +542,25 @@
       await expandRawList(list, opts.longText);
       const posts = list.map(parsePost).filter(Boolean);
       for (const p of posts) await fetchCommentsFor(p);
+
+      const fresh = posts.filter((p) => !seenIds.has(p.id));
+      fresh.forEach((p) => seenIds.add(p.id));
+
       await dbPutAll('posts', posts);
-      state.fetched += posts.length;
+      state.fetched += fresh.length;
       state.page = page;
       await saveResume(uid);
       updateProgress();
 
       if (!posts.length) break;
+      if (!fresh.length) {
+        if (++noNewStreak >= 2) {
+          setStatus('接口未再返回新数据，已停止翻页（共 ' + seenIds.size + ' 条）');
+          break;
+        }
+      } else {
+        noNewStreak = 0;
+      }
       if (state.total && state.fetched >= state.total) break;
       page++;
       await sleep(opts.delay);
@@ -1120,19 +1148,28 @@
   async function resolveUid(input) {
     const t = String(input || '').trim();
     if (/^\d+$/.test(t)) return t;
+    // 填了昵称：先走搜索接口
+    if (t) {
+      try {
+        const json = await apiGet('/side/search', { q: t }, { retries: 2, retryDelay: 2000, timeout: 10000 });
+        const users = (json.data && json.data.users) || [];
+        if (users.length && users[0].id) return String(users[0].id);
+      } catch (e) { /* 继续兜底 */ }
+    }
+    // 没填 / 搜索失败：优先用当前登录账号自己的 uid（页面上的 $CONFIG.oid 可能是别人）
     try {
-      const json = await apiGet('/side/search', { q: t }, { retries: 2, retryDelay: 2000, timeout: 10000 });
-      const users = (json.data && json.data.users) || [];
-      if (users.length && users[0].id) return String(users[0].id);
+      const json = await apiGet('/profile/info', {}, { retries: 1, retryDelay: 2000 });
+      const u = (json.data && json.data.user) || {};
+      if (u.idstr || u.id) return String(u.idstr || u.id);
     } catch (e) { /* ignore */ }
-    return '';
+    return detectUid();
   }
 
   async function run() {
     if (state.running) return;
     const uid = await resolveUid(opts.uid);
     if (!uid) {
-      setStatus('无法确定 uid：请填写数字 uid，或先登录微博并访问 weibo.com');
+      setStatus('无法确定 uid：请确认已登录 weibo.com，或手填数字 uid 后重试；也可点“自检”查看接口状态');
       return;
     }
     opts.uid = uid;
@@ -1234,11 +1271,49 @@
     updateProgress();
     setStatus('已清空本地缓存');
   }
+
+  // 自检：把 uid 来源、登录会话、首屏接口的真实返回打印到面板，便于定位失效原因
+  async function selfCheck() {
+    const out = [];
+    const cfg = (win && win.$CONFIG) || {};
+    const st = (win && win.__INITIAL_STATE__) || {};
+    const ds = (doc && doc.documentElement && doc.documentElement.dataset) || {};
+    out.push('环境：' + (win && win.location ? win.location.host : '?') + ' · v' + SCRIPT_VERSION);
+    out.push('uid 来源：$CONFIG=' + (cfg.oid || '-') +
+      ' | URL=' + (detectUid() || '-') +
+      ' | dataset=' + (ds.wbxOid || ds.wbxUid || '-') +
+      ' | loginInfo=' + ((st.loginInfo && st.loginInfo.uid) || '-'));
+    try {
+      const j = await apiGet('/profile/info', {}, { retries: 0 });
+      const u = (j.data && j.data.user) || {};
+      out.push('登录会话：ok uid=' + (u.idstr || u.id || '?') + ' 昵称=' + (u.screen_name || '?'));
+    } catch (e) {
+      out.push('登录会话：失败 — ' + e.message);
+    }
+    const uid = String(opts.uid || '').trim().replace(/\D/g, '') || detectUid();
+    if (!uid) {
+      out.push('微博接口：跳过（没有可用 uid）');
+    } else {
+      try {
+        const j = await apiGet('/statuses/mymblog', { uid, page: 1, feature: 0 }, { retries: 0 });
+        const d = j.data || {};
+        const list = Array.isArray(d.list) ? d.list : [];
+        out.push('mymblog：ok 本页=' + list.length + ' total=' + (d.total || '?') +
+          ' since_id=' + (d.since_id || '-'));
+        if (list[0]) out.push('首条字段：' + Object.keys(list[0]).slice(0, 12).join(', '));
+      } catch (e) {
+        out.push('mymblog：失败 — ' + e.message);
+      }
+    }
+    setStatus(out.join('\n'));
+    console.log('[weibo-export] 自检结果', out);
+  }
+
   // ==================== 界面 ====================
   function setStatus(text) {
     if (!doc) return;
     const el = $wbx && $wbx.status;
-    if (el) el.innerHTML = esc(text);
+    if (el) el.innerHTML = esc(text).replace(/\n/g, '<br>');
   }
 
   function updateProgress() {
@@ -1319,8 +1394,8 @@
     const rangeHtml = '<select id="wbx-range">' +
       '<option value="all"' + (opts.isFetchAll ? ' selected' : '') + '>全部微博</option>' +
       '<option value="range"' + (!opts.isFetchAll ? ' selected' : '') + '>时间范围</option></select>' +
-      '<input type="date" id="wbx-start" value="' + esc(opts.startAt) + '" /> ~ ' +
-      '<input type="date" id="wbx-end" value="' + esc(opts.endAt) + '" />';
+      '<input type="date" id="wbx-start-date" value="' + esc(opts.startAt) + '" /> ~ ' +
+      '<input type="date" id="wbx-end-date" value="' + esc(opts.endAt) + '" />';
     panel.innerHTML =
       '<div class="wbx-head"><span>📦 微博备份导出 v' + SCRIPT_VERSION + '</span><span style="margin-left:auto;color:#999;font-weight:400" id="wbx-min">收起 ▲</span></div>' +
       '<div class="wbx-body" id="wbx-body">' +
@@ -1363,6 +1438,7 @@
       '<button class="wbx-btn blue" id="wbx-export-pdf">打印 PDF</button>' +
       '<button class="wbx-btn gray" id="wbx-export-imgs">图片CSV</button>' +
       '<button class="wbx-btn gray" id="wbx-clear">清空</button>' +
+      '<button class="wbx-btn gray" id="wbx-check">自检</button>' +
       '</div>' +
       '<div class="wbx-bar"><div id="wbx-bar-inner"></div></div>' +
       '<div class="wbx-count" id="wbx-count"></div>' +
@@ -1376,8 +1452,8 @@
       min: panel.querySelector('#wbx-min'),
       uidInput: panel.querySelector('#wbx-uid'),
       rangeSelect: panel.querySelector('#wbx-range'),
-      startInput: panel.querySelector('#wbx-start'),
-      endInput: panel.querySelector('#wbx-end'),
+      startInput: panel.querySelector('#wbx-start-date'),
+      endInput: panel.querySelector('#wbx-end-date'),
       repostCb: panel.querySelector('#wbx-repost'),
       longCb: panel.querySelector('#wbx-long'),
       commentCb: panel.querySelector('#wbx-comment'),
@@ -1398,6 +1474,7 @@
       exportPdfBtn: panel.querySelector('#wbx-export-pdf'),
       exportImgsBtn: panel.querySelector('#wbx-export-imgs'),
       clearBtn: panel.querySelector('#wbx-clear'),
+      checkBtn: panel.querySelector('#wbx-check'),
       bar: panel.querySelector('#wbx-bar-inner'),
       count: panel.querySelector('#wbx-count'),
       status: panel.querySelector('#wbx-status'),
@@ -1433,6 +1510,7 @@
     $wbx.exportPdfBtn.addEventListener('click', () => { collectOptionsFromUI(); exportPDF(); });
     $wbx.exportImgsBtn.addEventListener('click', () => { collectOptionsFromUI(); exportImagesCSV(); });
     $wbx.clearBtn.addEventListener('click', clearData);
+    $wbx.checkBtn.addEventListener('click', () => { collectOptionsFromUI(); selfCheck(); });
 
     setStatus('就绪。填写/确认 uid 后点“开始导出”。');
   }

@@ -134,5 +134,18 @@ console.log('[ok] transText 短链/@/话题/表情/换行');
   assert.strictEqual(partsArr.join(''), html, 'parts 拼接应与 buildHtml 一致');
   console.log('[ok] buildHtmlParts');
 
+  // 面板 id 唯一性：日期框与「开始导出」按钮曾共用 id="wbx-start"，
+  // 导致 querySelector 拿到日期框、按钮点击监听器绑错元素（点开始无反应）
+  const fs = require('fs');
+  const path = require('path');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'weibo-export.user.js'), 'utf8');
+  const ids = Array.from(src.matchAll(/id="(wbx-[a-z-]+)"/g), (m) => m[1]);
+  const dup = ids.filter((v, i) => ids.indexOf(v) !== i);
+  assert.deepStrictEqual(dup, [], '面板 id 不应重复，重复项：' + dup.join(', '));
+  assert.ok(src.includes("startBtn: panel.querySelector('#wbx-start')"), '开始按钮应绑定到按钮元素');
+  assert.ok(src.includes("startInput: panel.querySelector('#wbx-start-date')"), '开始日期应绑定到日期输入框');
+  assert.ok(src.includes("endInput: panel.querySelector('#wbx-end-date')"), '结束日期应绑定到日期输入框');
+  console.log('[ok] 面板 id 唯一 / 开始按钮绑定');
+
   console.log('ALL TESTS PASSED');
 })().catch((e) => { console.error('TEST FAILED:', e); process.exit(1); });
