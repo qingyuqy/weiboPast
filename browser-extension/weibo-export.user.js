@@ -2,7 +2,7 @@
 // @name         微博备份导出（本人微博 → JSON / 可打印 HTML / PDF）
 // @name:en      Weibo Export (own posts -> JSON / printable HTML / PDF)
 // @namespace    qingyu.weibo-export
-// @version      0.2.11
+// @version      0.2.12
 // @description  结合 Weibo-archiver 与 WeiBack 思路：抓取本人全部微博（since_id 全量翻页、长文、评论、收藏、关注），IndexedDB 本地存储支持断点续传；导出 JSON 与可打印 HTML（浏览器 Ctrl+P 存 PDF），可选图片内嵌做离线导出。
 // @description:en Fetch your own Weibo posts (since_id paging, long-text, comments, favorites, followings), store in IndexedDB with resume; export JSON & printable HTML (Ctrl+P to PDF), optional embedded images for offline use.
 // @author       qingyu
@@ -21,7 +21,7 @@
   const LS_OPTIONS = 'wbx-options-v1';
   const DB_NAME = 'weibo-export';
   const DB_VERSION = 1;
-  const SCRIPT_VERSION = '0.2.11';
+  const SCRIPT_VERSION = '0.2.12';
   const doc = typeof document !== 'undefined' ? document : null;
   const win = typeof window !== 'undefined' ? window : null;
 
@@ -642,10 +642,19 @@
       state.fetched += fresh.length;
 
       const tail = posts[posts.length - 1];
-      // 用本页「最小 id」当游标，而不是「最后一条」：置顶/广告等排序异常时
-      // 末条的 id 未必最小；再减 1 避免边界那条被重复返回后判定为「无新数据」
+      // 优先用服务端返回的 since_id 当游标（微博自己的“加载更早”游标）；
+      // 只有它没有后退时才退回「本页最小 id − 1」。
+      // 用最小 id 而不是末条：置顶/推广等异常排序时末条未必最旧；
+      // 减 1 避免边界那条被重复返回后误判为「无新数据」。
+      const serverCursor = data.since_id ? String(data.since_id) : '';
       const minId = minIdOf(posts);
-      const next = minId ? (BigInt(minId) - 1n).toString() : '';
+      let next = '';
+      if (/^\d+$/.test(serverCursor) && /^\d+$/.test(cursor) &&
+          BigInt(serverCursor) < BigInt(cursor)) {
+        next = serverCursor;
+      } else if (minId) {
+        next = (BigInt(minId) - 1n).toString();
+      }
       updateProgress();
       console.log('[weibo-export] 游标 本页=' + list.length + ' 新增=' + fresh.length +
         ' 累计=' + state.fetched + '/' + (state.total || '?') +
