@@ -29,7 +29,7 @@ cd android-app && ./gradlew assembleRelease
 
 ## ② browser-extension/ — 浏览器扩展（Manifest V3）/ 油猴脚本
 
-版本 0.2.9，同一份脚本同时支持 Chrome/Edge 扩展安装与 Tampermonkey 安装。
+版本 0.2.10，同一份脚本同时支持 Chrome/Edge 扩展安装与 Tampermonkey 安装。
 
 **抓取**：`weibo.com/ajax` 接口全量翻页（`since_id`）、可选时间范围、长文展开、
 一级评论（5/10/20 条）、收藏、关注列表；实时写入 **IndexedDB**，支持断点续传、
