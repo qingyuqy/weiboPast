@@ -2,7 +2,7 @@
 // @name         微博备份导出（本人微博 → JSON / 可打印 HTML / PDF）
 // @name:en      Weibo Export (own posts -> JSON / printable HTML / PDF)
 // @namespace    qingyu.weibo-export
-// @version      0.2.8
+// @version      0.2.9
 // @description  结合 Weibo-archiver 与 WeiBack 思路：抓取本人全部微博（since_id 全量翻页、长文、评论、收藏、关注），IndexedDB 本地存储支持断点续传；导出 JSON 与可打印 HTML（浏览器 Ctrl+P 存 PDF），可选图片内嵌做离线导出。
 // @description:en Fetch your own Weibo posts (since_id paging, long-text, comments, favorites, followings), store in IndexedDB with resume; export JSON & printable HTML (Ctrl+P to PDF), optional embedded images for offline use.
 // @author       qingyu
@@ -21,7 +21,7 @@
   const LS_OPTIONS = 'wbx-options-v1';
   const DB_NAME = 'weibo-export';
   const DB_VERSION = 1;
-  const SCRIPT_VERSION = '0.2.8';
+  const SCRIPT_VERSION = '0.2.9';
   const doc = typeof document !== 'undefined' ? document : null;
   const win = typeof window !== 'undefined' ? window : null;
 
@@ -516,13 +516,29 @@
 
   async function fetchAllBySinceId(uid) {
     // 只用 page 翻页。若同时传 page 和 since_id，微博会把 since_id 当游标
-    // （只返回比它更早的微博），又叠加 page 偏移，等于每页多跳一整页，
-    // 游标很快到底、接口返回空列表，于是只抓到一两百条就「完成」。
-    let page = 1;
+    // （只返回比它更早的微博），又叠加 page 偏移，等于每页多跳一整页。
+    // page 本身还有深度上限（实测约 13~14 页后返回空列表），因此到顶后
+    // 依次改走「since_id 游标」和「时间窗口」两条兜底路径。
+    let page = state.page || 1;
     let guard = 0;
     const seenIds = new Set();
     let stalePages = 0;
     let oldestDate = null;
+    let oldestId = '';
+
+    // 续传时先把已缓存的数据读进来：既能正确去重，也能从真正最旧的一条继续
+    try {
+      const existing = await dbGetAll('posts');
+      for (const p of existing) {
+        seenIds.add(String(p.id));
+        const d = parseDate(p.createdAt);
+        if (d && (!oldestDate || d < oldestDate)) {
+          oldestDate = d;
+          oldestId = String(p.id);
+        }
+      }
+      if (seenIds.size) console.log('[weibo-export] 本地已有 ' + seenIds.size + ' 条缓存，继续抓取');
+    } catch (e) { /* 读不到就按空缓存处理 */ }
 
     while (true) {
       if (++guard > 20000) { state.stopReason = '达到翻页次数上限'; break; }
@@ -556,7 +572,10 @@
       updateProgress();
 
       const tail = posts[posts.length - 1];
-      if (tail) oldestDate = parseDate(tail.createdAt) || oldestDate;
+      if (tail) {
+        oldestDate = parseDate(tail.createdAt) || oldestDate;
+        oldestId = String(tail.id) || oldestId;
+      }
       console.log('[weibo-export] page=' + page + ' 本页=' + list.length + ' 新增=' + fresh.length +
         ' 累计=' + state.fetched + '/' + (state.total || '?') +
         ' 最旧=' + (tail ? tail.createdAt : '-'));
@@ -572,11 +591,70 @@
       await sleep(opts.delay);
     }
 
-    // 翻页接口提前结束（常见于深度翻页被截断）时，用时间窗口接口继续补齐
+    // 兜底 1：把最旧一条的 id 当游标，page 固定为 1 继续往前翻
+    if (state.total && state.fetched < state.total - 5 && oldestId) {
+      setStatus('翻页到第 ' + page + ' 页被截断（' + state.fetched + '/' + state.total + '），改用游标继续…');
+      await fetchByCursorBackfill(uid, seenIds, oldestId);
+    }
+    // 兜底 2：游标也取不到时，按时间窗口继续
     if (state.total && state.fetched < state.total - 5 && oldestDate) {
-      setStatus('翻页只取到 ' + state.fetched + '/' + state.total + ' 条，改用时间窗口继续补齐…');
+      setStatus('游标取到 ' + state.fetched + '/' + state.total + ' 条，改用时间窗口继续补齐…');
       await fetchByWindowBackfill(uid, seenIds, oldestDate);
       state.stopReason = (state.stopReason ? state.stopReason + ' → ' : '') + '时间窗口补齐';
+    }
+  }
+
+  // 以最旧一条微博的 id 为游标，page 固定 1 继续往前抓。
+  // 深度翻页受 page 上限影响时，游标路径往往还能继续。
+  async function fetchByCursorBackfill(uid, seen, startId) {
+    let cursor = String(startId);
+    let guard = 0;
+    let stale = 0;
+
+    while (cursor) {
+      if (++guard > 5000) { state.stopReason = '游标翻页次数上限'; break; }
+      if (state.total && state.fetched >= state.total) break;
+      await waitWhilePaused();
+      const json = await apiGet('/statuses/mymblog', {
+        uid,
+        page: 1,
+        feature: 0,
+        since_id: cursor,
+        hasori: 1,
+        hasret: opts.hasRepost ? 1 : 0,
+        haspic: 1,
+        hastext: 1,
+        hasvideo: 1,
+        hasmuisc: 1,
+      });
+      const data = json.data || {};
+      const list = Array.isArray(data.list) ? data.list : [];
+      if (!list.length) { state.stopReason = '游标返回空列表'; break; }
+
+      await expandRawList(list, opts.longText);
+      const posts = list.map(parsePost).filter(Boolean);
+      for (const p of posts) await fetchCommentsFor(p);
+
+      const fresh = posts.filter((p) => !seen.has(p.id));
+      fresh.forEach((p) => seen.add(p.id));
+      await dbPutAll('posts', posts);
+      state.fetched += fresh.length;
+
+      const tail = posts[posts.length - 1];
+      const next = tail ? String(tail.id) : '';
+      updateProgress();
+      console.log('[weibo-export] 游标 本页=' + list.length + ' 新增=' + fresh.length +
+        ' 累计=' + state.fetched + '/' + (state.total || '?') +
+        ' 最旧=' + (tail ? tail.createdAt : '-'));
+
+      if (!fresh.length) {
+        if (++stale >= 2) { state.stopReason = '游标未再返回新数据'; break; }
+      } else {
+        stale = 0;
+      }
+      if (!next || next === cursor) { state.stopReason = '游标未前进'; break; }
+      cursor = next;
+      await sleep(opts.delay);
     }
   }
 
@@ -595,17 +673,20 @@
       if (state.total && state.fetched >= state.total) break;
       await waitWhilePaused();
       const starttime = Math.max(floor, endtime - YEAR);
+      // hasmuisc 是微博接口的历史拼写；同时带上 hasmusic，兼容两种实现
       const json = await apiGet('/statuses/searchProfile', {
         uid,
         page,
         starttime,
         endtime,
+        feature: 0,
         hasori: 1,
         hasret: opts.hasRepost ? 1 : 0,
         haspic: 1,
         hastext: 1,
         hasvideo: 1,
         hasmuisc: 1,
+        hasmusic: 1,
       });
       const data = json.data || {};
       const list = Array.isArray(data.list) ? data.list : [];
@@ -1387,6 +1468,38 @@
         if (list[0]) out.push('首条字段：' + Object.keys(list[0]).slice(0, 12).join(', '));
       } catch (e) {
         out.push('mymblog：失败 — ' + e.message);
+      }
+      // 诊断两条兜底路径是否可用
+      try {
+        const now = Math.floor(Date.now() / 1000);
+        const j = await apiGet('/statuses/searchProfile', {
+          uid, page: 1, starttime: now - 30 * 86400, endtime: now,
+          feature: 0, hasori: 1, hasret: 1, haspic: 1, hastext: 1, hasvideo: 1,
+        }, { retries: 0 });
+        const list = (j.data && j.data.list) || [];
+        out.push('searchProfile（近 30 天）：ok 本页=' + list.length);
+      } catch (e) {
+        out.push('searchProfile：失败 — ' + e.message);
+      }
+      try {
+        const cached = await dbGetAll('posts');
+        if (!cached.length) {
+          out.push('游标：跳过（本地暂无缓存，无法取最旧 id）');
+        } else {
+          let oldest = cached[0];
+          for (const p of cached) {
+            try {
+              if (BigInt(p.id) < BigInt(oldest.id)) oldest = p;
+            } catch (e) { /* id 非数字时忽略 */ }
+          }
+          const j = await apiGet('/statuses/mymblog', {
+            uid, page: 1, feature: 0, since_id: String(oldest.id),
+          }, { retries: 0 });
+          const list = (j.data && j.data.list) || [];
+          out.push('游标（since_id=' + String(oldest.id).slice(-6) + '…）：ok 本页=' + list.length);
+        }
+      } catch (e) {
+        out.push('游标：失败 — ' + e.message);
       }
     }
     setStatus(out.join('\n'));

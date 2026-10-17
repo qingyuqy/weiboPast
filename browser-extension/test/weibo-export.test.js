@@ -147,12 +147,21 @@ console.log('[ok] transText 短链/@/话题/表情/换行');
   assert.ok(src.includes("endInput: panel.querySelector('#wbx-end-date')"), '结束日期应绑定到日期输入框');
   console.log('[ok] 面板 id 唯一 / 开始按钮绑定');
 
-  // 翻页请求不能再传 since_id：与 page 同时出现时微博按游标+偏移双重生效，
+  // 翻页请求不能再同时带 page>1 和 since_id：微博会按游标+偏移双重生效，
   // 每页额外跳过一整页，表现为「只抓到一两百条就完成」
-  const mymblogCall = src.slice(src.indexOf("apiGet('/statuses/mymblog'"), src.indexOf("apiGet('/statuses/mymblog'") + 400);
-  assert.ok(!mymblogCall.includes('since_id'), 'mymblog 翻页不应传 since_id');
+  const pageLoop = src.slice(
+    src.indexOf('async function fetchAllBySinceId'),
+    src.indexOf('async function fetchByCursorBackfill')
+  );
+  assert.ok(!/since_id\s*:/.test(pageLoop), 'page 翻页不应传 since_id');
+  const cursorFn = src.slice(
+    src.indexOf('async function fetchByCursorBackfill'),
+    src.indexOf('async function fetchByWindowBackfill')
+  );
+  assert.ok(cursorFn.includes('since_id: cursor'), '游标兜底应使用 since_id');
+  assert.ok(cursorFn.includes('page: 1'), '游标兜底必须把 page 固定为 1');
   assert.ok(src.includes('fetchByWindowBackfill'), '应有时间窗口兜底补齐逻辑');
-  console.log('[ok] mymblog 翻页策略（不带 since_id，含窗口兜底）');
+  console.log('[ok] 翻页策略（page 翻页 / since_id 游标 / 时间窗口三级）');
 
   console.log('ALL TESTS PASSED');
 })().catch((e) => { console.error('TEST FAILED:', e); process.exit(1); });
