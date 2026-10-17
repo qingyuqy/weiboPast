@@ -7,7 +7,7 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
 // @name         微博备份导出（本人微博 → JSON / 可打印 HTML / PDF）
 // @name:en      Weibo Export (own posts -> JSON / printable HTML / PDF)
 // @namespace    qingyu.weibo-export
-// @version      0.2.10
+// @version      0.2.11
 // @description  结合 Weibo-archiver 与 WeiBack 思路：抓取本人全部微博（since_id 全量翻页、长文、评论、收藏、关注），IndexedDB 本地存储支持断点续传；导出 JSON 与可打印 HTML（浏览器 Ctrl+P 存 PDF），可选图片内嵌做离线导出。
 // @description:en Fetch your own Weibo posts (since_id paging, long-text, comments, favorites, followings), store in IndexedDB with resume; export JSON & printable HTML (Ctrl+P to PDF), optional embedded images for offline use.
 // @author       qingyu
@@ -26,7 +26,7 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
   const LS_OPTIONS = 'wbx-options-v1';
   const DB_NAME = 'weibo-export';
   const DB_VERSION = 1;
-  const SCRIPT_VERSION = '0.2.10';
+  const SCRIPT_VERSION = '0.2.11';
   const doc = typeof document !== 'undefined' ? document : null;
   const win = typeof window !== 'undefined' ? window : null;
 
@@ -535,12 +535,11 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
     try {
       const existing = await dbGetAll('posts');
       for (const p of existing) {
-        seenIds.add(String(p.id));
+        const id = String(p.id);
+        seenIds.add(id);
         const d = parseDate(p.createdAt);
-        if (d && (!oldestDate || d < oldestDate)) {
-          oldestDate = d;
-          oldestId = String(p.id);
-        }
+        if (d && (!oldestDate || d < oldestDate)) oldestDate = d;
+        if (/^\d+$/.test(id) && (!oldestId || BigInt(id) < BigInt(oldestId))) oldestId = id;
       }
       if (seenIds.size) console.log('[weibo-export] 本地已有 ' + seenIds.size + ' 条缓存，继续抓取');
     } catch (e) { /* 读不到就按空缓存处理 */ }
@@ -577,10 +576,9 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
       updateProgress();
 
       const tail = posts[posts.length - 1];
-      if (tail) {
-        oldestDate = parseDate(tail.createdAt) || oldestDate;
-        oldestId = String(tail.id) || oldestId;
-      }
+      if (tail) oldestDate = parseDate(tail.createdAt) || oldestDate;
+      const pageMin = minIdOf(posts);
+      if (pageMin && (!oldestId || BigInt(pageMin) < BigInt(oldestId))) oldestId = pageMin;
       console.log('[weibo-export] page=' + page + ' 本页=' + list.length + ' 新增=' + fresh.length +
         ' 累计=' + state.fetched + '/' + (state.total || '?') +
         ' 最旧=' + (tail ? tail.createdAt : '-'));
@@ -612,7 +610,10 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
   // 以最旧一条微博的 id 为游标，page 固定 1 继续往前抓。
   // 深度翻页受 page 上限影响时，游标路径往往还能继续。
   async function fetchByCursorBackfill(uid, seen, startId) {
-    let cursor = String(startId);
+    // 从「已知最旧 id - 1」开始，避免把边界那条微博重复请求一遍
+    let cursor = /^\d+$/.test(String(startId))
+      ? (BigInt(String(startId)) - 1n).toString()
+      : '';
     let guard = 0;
     let stale = 0;
 
@@ -646,7 +647,10 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
       state.fetched += fresh.length;
 
       const tail = posts[posts.length - 1];
-      const next = tail ? String(tail.id) : '';
+      // 用本页「最小 id」当游标，而不是「最后一条」：置顶/广告等排序异常时
+      // 末条的 id 未必最小；再减 1 避免边界那条被重复返回后判定为「无新数据」
+      const minId = minIdOf(posts);
+      const next = minId ? (BigInt(minId) - 1n).toString() : '';
       updateProgress();
       console.log('[weibo-export] 游标 本页=' + list.length + ' 新增=' + fresh.length +
         ' 累计=' + state.fetched + '/' + (state.total || '?') +
@@ -661,6 +665,17 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
       cursor = next;
       await sleep(opts.delay);
     }
+  }
+
+  // 取一批微博里最小的数字 id（BigInt 比较，避免 16 位 id 精度丢失）
+  function minIdOf(posts) {
+    let min = null;
+    for (const p of posts || []) {
+      const id = String((p && p.id) || '');
+      if (!/^\d+$/.test(id)) continue;
+      if (min === null || BigInt(id) < BigInt(min)) min = id;
+    }
+    return min;
   }
 
   // 从 beforeDate 往前（更早）按时间窗口抓取，作为翻页失效时的兜底。
@@ -1510,6 +1525,30 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
         }
       } catch (e) {
         out.push('游标：失败 — ' + e.message);
+      }
+
+      // 覆盖度：按年份统计已缓存条数，一眼看出缺口在早年在近期
+      try {
+        const cached = await dbGetAll('posts');
+        if (cached.length) {
+          const byYear = {};
+          let minD = null, maxD = null;
+          for (const p of cached) {
+            const d = parseDate(p.createdAt);
+            if (!d) continue;
+            const y = d.getFullYear();
+            byYear[y] = (byYear[y] || 0) + 1;
+            if (!minD || d < minD) minD = d;
+            if (!maxD || d > maxD) maxD = d;
+          }
+          out.push('缓存 ' + cached.length + ' 条：' +
+            (minD ? formatDate(minD, 'YYYY-MM-DD') : '?') + ' ~ ' +
+            (maxD ? formatDate(maxD, 'YYYY-MM-DD') : '?'));
+          out.push('按年：' + Object.keys(byYear).sort()
+            .map((y) => y + ':' + byYear[y]).join(' '));
+        }
+      } catch (e) {
+        out.push('覆盖度统计失败 — ' + e.message);
       }
     }
     setStatus(out.join('\n'));
