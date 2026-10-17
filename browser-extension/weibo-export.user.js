@@ -2,7 +2,7 @@
 // @name         微博备份导出（本人微博 → JSON / 可打印 HTML / PDF）
 // @name:en      Weibo Export (own posts -> JSON / printable HTML / PDF)
 // @namespace    qingyu.weibo-export
-// @version      0.2.12
+// @version      0.2.13
 // @description  结合 Weibo-archiver 与 WeiBack 思路：抓取本人全部微博（since_id 全量翻页、长文、评论、收藏、关注），IndexedDB 本地存储支持断点续传；导出 JSON 与可打印 HTML（浏览器 Ctrl+P 存 PDF），可选图片内嵌做离线导出。
 // @description:en Fetch your own Weibo posts (since_id paging, long-text, comments, favorites, followings), store in IndexedDB with resume; export JSON & printable HTML (Ctrl+P to PDF), optional embedded images for offline use.
 // @author       qingyu
@@ -21,7 +21,7 @@
   const LS_OPTIONS = 'wbx-options-v1';
   const DB_NAME = 'weibo-export';
   const DB_VERSION = 1;
-  const SCRIPT_VERSION = '0.2.12';
+  const SCRIPT_VERSION = '0.2.13';
   const doc = typeof document !== 'undefined' ? document : null;
   const win = typeof window !== 'undefined' ? window : null;
 
@@ -599,6 +599,81 @@
       setStatus('游标取到 ' + state.fetched + '/' + state.total + ' 条，改用时间窗口继续补齐…');
       await fetchByWindowBackfill(uid, seenIds, oldestDate);
       state.stopReason = (state.stopReason ? state.stopReason + ' → ' : '') + '时间窗口补齐';
+    }
+    // 兜底 3：时间线上存在异常长的空档时，用游标在空档区间内补抓
+    if (state.total && state.fetched < state.total - 5) {
+      await fillSuspiciousGaps(uid, seenIds);
+    }
+  }
+
+  // 找出缓存里相邻两条微博间隔异常大（>90 天）的位置，以缺口上沿那条的 id
+  // 为游标在该区间内翻页补抓。没有缺口时不会有任何请求。
+  async function fillSuspiciousGaps(uid, seen) {
+    let cached = [];
+    try { cached = await dbGetAll('posts'); } catch (e) { return; }
+    if (cached.length < 2) return;
+
+    const dated = cached
+      .map((p) => ({ p, d: parseDate(p.createdAt) }))
+      .filter((x) => x.d)
+      .sort((a, b) => a.d - b.d);
+    if (dated.length < 2) return;
+
+    const GAP_MS = 90 * 86400000;
+    const gaps = [];
+    for (let i = 1; i < dated.length; i++) {
+      if (dated[i].d - dated[i - 1].d > GAP_MS) {
+        gaps.push({ from: dated[i - 1], to: dated[i] });
+      }
+    }
+    if (!gaps.length) return;
+
+    gaps.sort((a, b) => (b.to.d - b.from.d) - (a.to.d - a.from.d));
+    const limit = Math.min(10, gaps.length);
+    console.log('[weibo-export] 发现 ' + gaps.length + ' 处时间缺口，补抓最大的 ' + limit + ' 处');
+    setStatus('发现 ' + gaps.length + ' 处时间缺口，正在补抓…');
+
+    for (let g = 0; g < limit; g++) {
+      if (state.total && state.fetched >= state.total) break;
+      const gap = gaps[g];
+      let page = 1;
+      while (page <= 3) {
+        if (state.total && state.fetched >= state.total) break;
+        await waitWhilePaused();
+        const json = await apiGet('/statuses/mymblog', {
+          uid,
+          page,
+          feature: 0,
+          since_id: String(gap.to.p.id),
+          hasori: 1,
+          hasret: opts.hasRepost ? 1 : 0,
+          haspic: 1,
+          hastext: 1,
+          hasvideo: 1,
+          hasmuisc: 1,
+        });
+        const list = (json.data && json.data.list) || [];
+        if (!list.length) break;
+
+        await expandRawList(list, opts.longText);
+        const posts = list.map(parsePost).filter(Boolean);
+        for (const p of posts) await fetchCommentsFor(p);
+
+        const fresh = posts.filter((p) => !seen.has(p.id));
+        fresh.forEach((p) => seen.add(p.id));
+        await dbPutAll('posts', posts);
+        state.fetched += fresh.length;
+        updateProgress();
+        console.log('[weibo-export] 缺口 ' + formatDate(gap.from.p.createdAt) + '~' +
+          formatDate(gap.to.p.createdAt) + ' page=' + page + ' 新增=' + fresh.length +
+          ' 累计=' + state.fetched + '/' + (state.total || '?'));
+
+        if (!fresh.length) break;
+        const tailD = posts.length ? parseDate(posts[posts.length - 1].createdAt) : null;
+        if (tailD && tailD <= gap.from.d) break;
+        page++;
+        await sleep(opts.delay);
+      }
     }
   }
 
@@ -1415,11 +1490,16 @@
         await saveResume(uid);
       }
       const count = await dbCount('posts');
-      const complete = !state.total || count >= state.total - 5;
-      setStatus('抓取完成！共 ' + count + ' 条微博' +
+      const complete = !state.total || count >= state.total - 6;
+      let msg = '抓取完成！共 ' + count + ' 条微博' +
         (!complete ? '（接口显示总数 ' + state.total + '）' : '') +
         (!complete && state.stopReason ? '｜结束原因：' + state.stopReason : '') +
-        '，可点击“导出 JSON / 导出 HTML”');
+        '，可点击“导出 JSON / 导出 HTML”';
+      if (!complete) {
+        const cov = await coverageSummary();
+        if (cov) msg += '\n按年：' + cov;
+      }
+      setStatus(msg);
     } catch (e) {
       if (e && e.message === '已停止') {
         setStatus('已停止，进度已保存，可稍后点“继续导出”');
@@ -1464,6 +1544,31 @@
     state.phaseFlags = {};
     updateProgress();
     setStatus('已清空本地缓存');
+  }
+
+  // 缓存覆盖度：时间范围 + 按年份条数，用于判断缺口位置
+  async function coverageSummary() {
+    try {
+      const cached = await dbGetAll('posts');
+      if (!cached.length) return '';
+      const byYear = {};
+      let minD = null, maxD = null;
+      for (const p of cached) {
+        const d = parseDate(p.createdAt);
+        if (!d) continue;
+        const y = d.getFullYear();
+        byYear[y] = (byYear[y] || 0) + 1;
+        if (!minD || d < minD) minD = d;
+        if (!maxD || d > maxD) maxD = d;
+      }
+      const range = (minD ? formatDate(minD, 'YYYY-MM-DD') : '?') + ' ~ ' +
+        (maxD ? formatDate(maxD, 'YYYY-MM-DD') : '?');
+      const years = Object.keys(byYear).sort()
+        .map((y) => y + ':' + byYear[y]).join(' ');
+      return years ? range + '｜' + years : range;
+    } catch (e) {
+      return '';
+    }
   }
 
   // 自检：把 uid 来源、登录会话、首屏接口的真实返回打印到面板，便于定位失效原因

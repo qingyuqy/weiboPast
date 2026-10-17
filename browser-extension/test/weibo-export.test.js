@@ -151,7 +151,7 @@ console.log('[ok] transText 短链/@/话题/表情/换行');
   // 每页额外跳过一整页，表现为「只抓到一两百条就完成」
   const pageLoop = src.slice(
     src.indexOf('async function fetchAllBySinceId'),
-    src.indexOf('async function fetchByCursorBackfill')
+    src.indexOf('// 兜底 1：')
   );
   assert.ok(!/since_id\s*:/.test(pageLoop), 'page 翻页不应传 since_id');
   const cursorFn = src.slice(
