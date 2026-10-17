@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "微博备份导出",
-  "version": "0.2.13",
+  "version": "0.2.14",
   "description": "抓取本人微博并导出 JSON / 可打印 HTML（浏览器打开后 Ctrl+P 存 PDF）。数据只保存在本机浏览器。",
   "minimum_chrome_version": "111",
   "host_permissions": [
