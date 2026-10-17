@@ -1,36 +1,21 @@
-﻿*.iml
-.gradle
-/local.properties
+# --- Node / browser-extension ---
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# --- Python / python-tools ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- Editors / OS ---
 .DS_Store
 Thumbs.db
 *.swp
 *.swo
-*.apk
-*.aab
-*.ap_
-*.dex
-bin/
-gen/
-out/
-build/
-app/build/
-.gradle/
-gradle/caches/
-gradle/daemon/
-gradle/native/
-gradle/wrapper/dists/
 .idea/
-/captures
-.externalNativeBuild
-*.png
-*.jpg
-*.jpeg
-*.gif
-backup_*.java
-classes_temp.jar
-build_output.txt
-ui*.xml
-*.jar
-!app/libs/*.jar
-app/libs/*.aar
-screenshots/
+.vscode/
+
+# --- Local scratch ---
+*.log
