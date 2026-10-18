@@ -7,7 +7,7 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
 // @name         微博备份导出（本人微博 → JSON / 可打印 HTML / PDF）
 // @name:en      Weibo Export (own posts -> JSON / printable HTML / PDF)
 // @namespace    qingyu.weibo-export
-// @version      0.2.15
+// @version      0.2.16
 // @description  结合 Weibo-archiver 与 WeiBack 思路：抓取本人全部微博（since_id 全量翻页、长文、评论、收藏、关注），IndexedDB 本地存储支持断点续传；导出 JSON 与可打印 HTML（浏览器 Ctrl+P 存 PDF），可选图片内嵌做离线导出。
 // @description:en Fetch your own Weibo posts (since_id paging, long-text, comments, favorites, followings), store in IndexedDB with resume; export JSON & printable HTML (Ctrl+P to PDF), optional embedded images for offline use.
 // @author       qingyu
@@ -26,7 +26,7 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
   const LS_OPTIONS = 'wbx-options-v1';
   const DB_NAME = 'weibo-export';
   const DB_VERSION = 1;
-  const SCRIPT_VERSION = '0.2.15';
+  const SCRIPT_VERSION = '0.2.16';
   const doc = typeof document !== 'undefined' ? document : null;
   const win = typeof window !== 'undefined' ? window : null;
 
@@ -628,6 +628,13 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
     const nowYear = new Date().getFullYear();
     let totalAdded = 0;
 
+    // 记录每年抓取前的缓存条数，便于对比「接口返回」判断该年是否被截断
+    const cachedByYear = {};
+    for (const x of dated) {
+      const y = x.d.getFullYear();
+      cachedByYear[y] = (cachedByYear[y] || 0) + 1;
+    }
+
     for (let y = firstYear; y <= nowYear; y++) {
       if (state.total && state.fetched >= state.total) break;
       const starttime = Math.floor(Date.UTC(y, 0, 1) / 1000);
@@ -637,7 +644,7 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
       let yearSeen = 0;
       let lastFirstId = '';
 
-      while (page <= 10) {
+      while (page <= 100) {
         if (state.total && state.fetched >= state.total) break;
         await waitWhilePaused();
         const json = await apiGet('/statuses/searchProfile', {
@@ -679,9 +686,11 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
       }
 
       totalAdded += yearAdded;
-      console.log('[weibo-export] 年度校验 ' + y + ' 接口返回=' + yearSeen +
-        ' 新增=' + yearAdded + ' 累计=' + state.fetched + '/' + (state.total || '?'));
-      setStatus('年度校验 ' + y + '：接口返回 ' + yearSeen + ' / 新增 ' + yearAdded +
+      console.log('[weibo-export] 年度校验 ' + y + ' 缓存=' + (cachedByYear[y] || 0) +
+        ' 接口返回=' + yearSeen + ' 新增=' + yearAdded +
+        ' 累计=' + state.fetched + '/' + (state.total || '?'));
+      setStatus('年度校验 ' + y + '：缓存 ' + (cachedByYear[y] || 0) + ' / 接口返回 ' +
+        yearSeen + ' / 新增 ' + yearAdded +
         '（累计 ' + state.fetched + '/' + (state.total || '?') + '）');
     }
     return totalAdded;
