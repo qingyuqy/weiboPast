@@ -7,7 +7,7 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
 // @name         微博备份导出（本人微博 → JSON / 可打印 HTML / PDF）
 // @name:en      Weibo Export (own posts -> JSON / printable HTML / PDF)
 // @namespace    qingyu.weibo-export
-// @version      0.2.14
+// @version      0.2.15
 // @description  结合 Weibo-archiver 与 WeiBack 思路：抓取本人全部微博（since_id 全量翻页、长文、评论、收藏、关注），IndexedDB 本地存储支持断点续传；导出 JSON 与可打印 HTML（浏览器 Ctrl+P 存 PDF），可选图片内嵌做离线导出。
 // @description:en Fetch your own Weibo posts (since_id paging, long-text, comments, favorites, followings), store in IndexedDB with resume; export JSON & printable HTML (Ctrl+P to PDF), optional embedded images for offline use.
 // @author       qingyu
@@ -26,7 +26,7 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
   const LS_OPTIONS = 'wbx-options-v1';
   const DB_NAME = 'weibo-export';
   const DB_VERSION = 1;
-  const SCRIPT_VERSION = '0.2.14';
+  const SCRIPT_VERSION = '0.2.15';
   const doc = typeof document !== 'undefined' ? document : null;
   const win = typeof window !== 'undefined' ? window : null;
 
@@ -635,8 +635,9 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
       let page = 1;
       let yearAdded = 0;
       let yearSeen = 0;
+      let lastFirstId = '';
 
-      while (page <= 50) {
+      while (page <= 10) {
         if (state.total && state.fetched >= state.total) break;
         await waitWhilePaused();
         const json = await apiGet('/statuses/searchProfile', {
@@ -657,6 +658,11 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
         if (!list.length) break;
         yearSeen += list.length;
 
+        // 接口若忽略 page，会反复返回同一页；用首条 id 判断并终止
+        const firstId = list[0] ? String(list[0].id || '') : '';
+        if (firstId && firstId === lastFirstId) break;
+        lastFirstId = firstId;
+
         await expandRawList(list, opts.longText);
         const posts = list.map(parsePost).filter(Boolean);
         for (const p of posts) await fetchCommentsFor(p);
@@ -668,7 +674,6 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
         yearAdded += fresh.length;
         updateProgress();
 
-        if (!fresh.length) break;
         page++;
         await sleep(opts.delay);
       }
@@ -833,25 +838,25 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
     return min;
   }
 
-  // 从 beforeDate 往前（更早）按时间窗口抓取，作为翻页失效时的兜底。
-  // 每次以一年为窗口，取尽后整体前移，直到覆盖到微博上线时间。
+  // 从 beforeDate 往前（更早）按一年一窗扫描，最多 20 个窗口。
+  // 注意：微博的 searchProfile 可能忽略时间参数、反复返回最新一页，
+  // 因此绝不能用「返回内容的日期」推进窗口（会被推回未来而震荡死循环），
+  // 只按窗口起点单调前移。
   async function fetchByWindowBackfill(uid, seen, beforeDate) {
     const YEAR = 365 * 24 * 3600;
     const floor = Math.floor(new Date(2009, 7, 1).getTime() / 1000);
     let endtime = Math.floor(beforeDate.getTime() / 1000) - 1;
-    let page = 1;
-    let lastDate = null;
     let guard = 0;
 
-    while (endtime > floor) {
-      if (++guard > 3000) break;
+    while (endtime > floor && guard < 20) {
+      guard++;
       if (state.total && state.fetched >= state.total) break;
       await waitWhilePaused();
       const starttime = Math.max(floor, endtime - YEAR);
       // hasmuisc 是微博接口的历史拼写；同时带上 hasmusic，兼容两种实现
       const json = await apiGet('/statuses/searchProfile', {
         uid,
-        page,
+        page: 1,
         starttime,
         endtime,
         feature: 0,
@@ -866,15 +871,6 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
       const data = json.data || {};
       const list = Array.isArray(data.list) ? data.list : [];
 
-      if (!list.length) {
-        // 该窗口取尽：以本窗口最后一条的日期为新起点，否则整窗前移
-        const d = lastDate && parseDate(lastDate);
-        endtime = d ? Math.floor(d.getTime() / 1000) - 1 : starttime - 1;
-        page = 1;
-        lastDate = null;
-        continue;
-      }
-
       await expandRawList(list, opts.longText);
       const posts = list.map(parsePost).filter(Boolean);
       for (const p of posts) await fetchCommentsFor(p);
@@ -883,22 +879,16 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
       fresh.forEach((p) => seen.add(p.id));
       await dbPutAll('posts', posts);
       state.fetched += fresh.length;
-
-      const tail = posts[posts.length - 1];
-      lastDate = tail ? tail.createdAt : lastDate;
       updateProgress();
-      console.log('[weibo-export] 窗口补齐 page=' + page + ' 本页=' + list.length +
-        ' 新增=' + fresh.length + ' 累计=' + state.fetched + '/' + (state.total || '?'));
 
-      // 本页全是旧数据：该窗口已取尽，前移
-      if (!fresh.length) {
-        const d = lastDate && parseDate(lastDate);
-        endtime = d ? Math.floor(d.getTime() / 1000) - 1 : starttime - 1;
-        page = 1;
-        lastDate = null;
-        continue;
-      }
-      page++;
+      const label = formatDate(new Date(starttime * 1000), 'YYYY-MM-DD') + '~' +
+        formatDate(new Date(endtime * 1000), 'YYYY-MM-DD');
+      console.log('[weibo-export] 窗口 ' + label + ' 返回=' + list.length +
+        ' 新增=' + fresh.length + ' 累计=' + state.fetched + '/' + (state.total || '?'));
+      setStatus('时间窗口 ' + label + '：返回 ' + list.length + ' 条 / 新增 ' + fresh.length +
+        '（累计 ' + state.fetched + '/' + (state.total || '?') + '）');
+
+      endtime = starttime - 1; // 单调前移，绝不因返回内容而回退或前进
       await sleep(opts.delay);
     }
   }
@@ -942,6 +932,15 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
       updateProgress();
 
       if (posts.length) {
+        if (page >= 50) {
+          // 单窗口翻页过多：说明接口可能忽略时间参数，强制前移避免死循环
+          const d = parseDate(lastDate);
+          endtime = d ? Math.min(endtime, Math.floor(d.getTime() / 1000) - 1) : endtime - YEAR;
+          page = 1;
+          lastDate = null;
+          await sleep(opts.delay);
+          continue;
+        }
         page++;
         await sleep(opts.delay);
       } else if (lastDate && state.total && state.fetched < state.total) {
@@ -949,7 +948,7 @@ window.__INITIAL_STATE__ = { loginInfo: { uid: '1234567890' } };
         const d = parseDate(lastDate);
         if (!d) break;
         d.setHours(23, 59, 0, 0);
-        endtime = d.getTime() / 1000 - 1;
+        endtime = Math.min(endtime, Math.floor(d.getTime() / 1000) - 1);
         page = 1;
         lastDate = null;
         await sleep(opts.delay);
